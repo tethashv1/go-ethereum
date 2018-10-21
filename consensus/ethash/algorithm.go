@@ -29,9 +29,11 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/bitutil"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/sha3"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 const (
@@ -229,9 +231,46 @@ func fnvHash(mix []uint32, data []uint32) {
 	}
 }
 
+/////////////////////////////////////////////////////////////////////////////////////
+// TAO.Foundation.
+// original implementation of fnv is exactly fnv0 simple implemention.
+// it is deprecated now. and little avalanche effects makes not secure for hash algorithm.
+// so,
+// Official maintained FNV algorithm sites has proposed newer version of fnv , name is fnv1 fnv1a
+// fnv1a is using FNV_OFFSET_BIAS for more avalanche effects on edge condition [0]
+//
+// it is implemented by TAO.Foundation , namely TEthashV1 (Trust Ethash Version1)
+// copyright . 2018
+//
+// Original Implementation of C is like this
+//
+// #define FNV_PRIME 0x01000193
+// #define FNV_OFFSET_BASIS 0x811c9dc5
+// #ifdef __ETHASH__
+// #define fnv(x, y) ((x)*FNV_PRIME ^ (y))
+// #define fnv_reduce(v) fnv(fnv(fnv(v.x, v.y), v.z), v.w)
+// #else  // default __TETHASHV1__
+// #define fnv(x, y) ((((FNV_OFFSET_BASIS ^ (x)) * FNV_PRIME) ^ (y)) * FNV_PRIME)
+// #define fnv_reduce(v) fnv(fnv(fnv(v.x, v.y), v.z), v.w)
+// #endif
+//
+// by. cpplover
+////////////////////////////////////////////////////////////////////////////////////////
+
+func fnv1a(a, b uint32) uint32 {
+	return ((0x811c9dc5^a)*0x01000193 ^ b)
+}
+
+// fnv1aHash mixes in data into mix using the TethashV1 fnv1a method.
+func fnv1aHash(mix []uint32, data []uint32) {
+	for i := 0; i < len(mix); i++ {
+		mix[i] = fnv1a(mix[i],data[i])
+	}
+}
+
 // generateDatasetItem combines data from 256 pseudorandomly selected cache nodes,
 // and hashes that to compute a single dataset node.
-func generateDatasetItem(cache []uint32, index uint32, keccak512 hasher) []byte {
+func generateDatasetItem(config *params.ChainConfig, cache []uint32, header *types.Header, index uint32, keccak512 hasher) []byte {
 	// Calculate the number of theoretical rows (we use one buffer nonetheless)
 	rows := uint32(len(cache) / hashWords)
 
@@ -249,11 +288,19 @@ func generateDatasetItem(cache []uint32, index uint32, keccak512 hasher) []byte 
 	for i := 0; i < len(intMix); i++ {
 		intMix[i] = binary.LittleEndian.Uint32(mix[i*4:])
 	}
-	// fnv it with a lot of random cache nodes based on index
-	for i := uint32(0); i < datasetParents; i++ {
-		parent := fnv(index^i, intMix[i%16]) % rows
-		fnvHash(intMix, cache[parent*hashWords:])
-	}
+	if config.IsTEthashV1(header.Number) {
+	  // fnv it with a lot of random cache nodes based on index
+	  for i := uint32(0); i < datasetParents; i++ {
+		  parent := fnv1a(index^i, intMix[i%16]) % rows
+		  fnv1aHash(intMix, cache[parent*hashWords:])
+	  }
+	} else {
+	  // fnv it with a lot of random cache nodes based on index
+	  for i := uint32(0); i < datasetParents; i++ {
+		  parent := fnv(index^i, intMix[i%16]) % rows
+		  fnvHash(intMix, cache[parent*hashWords:])
+	  }
+  }
 	// Flatten the uint32 mix into a binary one and return
 	for i, val := range intMix {
 		binary.LittleEndian.PutUint32(mix[i*4:], val)
@@ -313,7 +360,7 @@ func generateDataset(dest []uint32, epoch uint64, cache []uint32) {
 			// Calculate the dataset segment
 			percent := uint32(size / hashBytes / 100)
 			for index := first; index < limit; index++ {
-				item := generateDatasetItem(cache, index, keccak512)
+				item := generateDatasetItem(config, cache, header, index, keccak512)
 				if swapped {
 					swap(item)
 				}
@@ -331,7 +378,7 @@ func generateDataset(dest []uint32, epoch uint64, cache []uint32) {
 
 // hashimoto aggregates data from the full dataset in order to produce our final
 // value for a particular header hash and nonce.
-func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32) []uint32) ([]byte, []byte) {
+func hashimoto(config *params.ChainConfig, hash []byte, header *types.Header, nonce uint64, size uint64, lookup func(index uint32) []uint32) ([]byte, []byte) {
 	// Calculate the number of theoretical rows (we use one buffer nonetheless)
 	rows := uint32(size / mixBytes)
 
@@ -351,18 +398,33 @@ func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32)
 	// Mix in random dataset nodes
 	temp := make([]uint32, len(mix))
 
-	for i := 0; i < loopAccesses; i++ {
-		parent := fnv(uint32(i)^seedHead, mix[i%len(mix)]) % rows
-		for j := uint32(0); j < mixBytes/hashBytes; j++ {
-			copy(temp[j*hashWords:], lookup(2*parent+j))
-		}
-		fnvHash(mix, temp)
-	}
-	// Compress mix
-	for i := 0; i < len(mix); i += 4 {
-		mix[i/4] = fnv(fnv(fnv(mix[i], mix[i+1]), mix[i+2]), mix[i+3])
-	}
-	mix = mix[:len(mix)/4]
+  if config.IsTEthashV1(header.Number) {
+	  for i := 0; i < loopAccesses; i++ {
+		  parent := fnv1a(uint32(i)^seedHead, mix[i%len(mix)]) % rows
+		  for j := uint32(0); j < mixBytes/hashBytes; j++ {
+			  copy(temp[j*hashWords:], lookup(2*parent+j))
+		  }
+		  fnv1aHash(mix, temp)
+	  }
+	  // Compress mix
+	  for i := 0; i < len(mix); i += 4 {
+		  mix[i/4] = fnv1a(fnv1a(fnv1a(mix[i], mix[i+1]), mix[i+2]), mix[i+3])
+	  }
+	  mix = mix[:len(mix)/4]
+	} else {
+		for i := 0; i < loopAccesses; i++ {
+		  parent := fnv(uint32(i)^seedHead, mix[i%len(mix)]) % rows
+		  for j := uint32(0); j < mixBytes/hashBytes; j++ {
+			  copy(temp[j*hashWords:], lookup(2*parent+j))
+		  }
+		  fnvHash(mix, temp)
+	  }
+	  // Compress mix
+	  for i := 0; i < len(mix); i += 4 {
+		  mix[i/4] = fnv(fnv(fnv(mix[i], mix[i+1]), mix[i+2]), mix[i+3])
+	  }
+	  mix = mix[:len(mix)/4]
+  }
 
 	digest := make([]byte, common.HashLength)
 	for i, val := range mix {
@@ -378,7 +440,7 @@ func hashimotoLight(size uint64, cache []uint32, hash []byte, nonce uint64) ([]b
 	keccak512 := makeHasher(sha3.NewKeccak512())
 
 	lookup := func(index uint32) []uint32 {
-		rawData := generateDatasetItem(cache, index, keccak512)
+		rawData := generateDatasetItem(config, cache, header, index, keccak512)
 
 		data := make([]uint32, len(rawData)/4)
 		for i := 0; i < len(data); i++ {
@@ -386,7 +448,7 @@ func hashimotoLight(size uint64, cache []uint32, hash []byte, nonce uint64) ([]b
 		}
 		return data
 	}
-	return hashimoto(hash, nonce, size, lookup)
+	return hashimoto(config, hash, header, nonce, size, lookup)
 }
 
 // hashimotoFull aggregates data from the full dataset (using the full in-memory
@@ -397,7 +459,7 @@ func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte)
 		offset := index * hashWords
 		return dataset[offset : offset+hashWords]
 	}
-	return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup)
+	return hashimoto(config, hash, header, nonce, uint64(len(dataset))*4, lookup)
 }
 
 const maxEpoch = 2048
